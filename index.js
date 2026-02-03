@@ -74,6 +74,50 @@ function toBoolOrNull(v) {
   return null;
 }
 
+function findFirstKeyMatch(root, keySet, { maxDepth = 5, maxArray = 50, maxKeys = 200 } = {}) {
+  // Returns { path, value } where value is primitive (string/number/boolean), else null.
+  // Defensive limits to avoid expensive traversal on weird payloads.
+  const seen = new Set();
+  const queue = [{ value: root, path: '$', depth: 0 }];
+  let visitedKeys = 0;
+
+  while (queue.length) {
+    const { value, path, depth } = queue.shift();
+    if (!value || typeof value !== 'object') continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    if (depth >= maxDepth) continue;
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < Math.min(value.length, maxArray); i++) {
+        queue.push({ value: value[i], path: `${path}[${i}]`, depth: depth + 1 });
+      }
+      continue;
+    }
+
+    const keys = Object.keys(value);
+    for (const k of keys) {
+      visitedKeys++;
+      if (visitedKeys > maxKeys) return null;
+
+      const v = value[k];
+      if (keySet.has(String(k).toLowerCase())) {
+        if (v === null || v === undefined) {
+          // keep searching
+        } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+          return { path: `${path}.${k}`, value: v };
+        }
+      }
+
+      if (v && typeof v === 'object') {
+        queue.push({ value: v, path: `${path}.${k}`, depth: depth + 1 });
+      }
+    }
+  }
+
+  return null;
+}
+
 function computeApproval({ eventName, status, evt }) {
   const explicitApproved =
     toBoolOrNull(evt?.data?.approved) ??
@@ -95,6 +139,19 @@ function computeApproval({ eventName, status, evt }) {
 
   if (explicitPaid !== null) return explicitPaid;
 
+  // Timestamp-based signals (common in some providers).
+  const hasPaidAt = Boolean(
+    evt?.data?.paid_at ||
+      evt?.data?.paidAt ||
+      evt?.data?.approved_at ||
+      evt?.data?.approvedAt ||
+      evt?.data?.confirmed_at ||
+      evt?.data?.confirmedAt ||
+      evt?.data?.captured_at ||
+      evt?.data?.capturedAt
+  );
+  if (hasPaidAt) return true;
+
   // Normalize status/eventName based inference.
   const okStatuses = new Set([
     'approved',
@@ -107,6 +164,12 @@ function computeApproval({ eventName, status, evt }) {
     'settled',
     'authorized',
     'authorised',
+    // PT-BR common variants
+    'aprovado',
+    'pago',
+    'confirmado',
+    'concluido',
+    'concluído',
   ]);
   const notOkStatuses = new Set([
     'rejected',
@@ -118,6 +181,16 @@ function computeApproval({ eventName, status, evt }) {
     'refunded',
     'expired',
     'voided',
+    // PT-BR common variants
+    'recusado',
+    'rejeitado',
+    'falhou',
+    'cancelado',
+    'cancelada',
+    'estornado',
+    'estornada',
+    'expirado',
+    'expirada',
   ]);
 
   if (status && okStatuses.has(status)) return true;
@@ -281,6 +354,7 @@ async function logWebhookEvent(eventRow) {
 function sanitizeWebhookEvent(evt) {
   try {
     const data = evt?.data ?? null;
+    const foundStatus = findFirstKeyMatch(evt, new Set(['status', 'state', 'situation', 'payment_status', 'transaction_status']));
     return {
       hasData: Boolean(data),
       event:
@@ -296,6 +370,10 @@ function sanitizeWebhookEvent(evt) {
         null,
       topLevelKeys: Object.keys(evt || {}).slice(0, 50),
       dataKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 80) : null,
+      found: {
+        statusPath: foundStatus?.path ?? null,
+        statusValue: foundStatus?.value ?? null,
+      },
       data: {
         status:
           data?.status ||
@@ -423,7 +501,11 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.data?.order?.status ||
       evt?.status ||
       null;
-    const status = normalizeStatus(statusRaw);
+    const statusFallback =
+      statusRaw ??
+      findFirstKeyMatch(evt, new Set(['status', 'state', 'situation', 'payment_status', 'transaction_status']))?.value ??
+      null;
+    const status = normalizeStatus(statusFallback);
 
     ctxEventName = eventName;
     ctxStatus = status;
