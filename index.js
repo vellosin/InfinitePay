@@ -251,6 +251,41 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
   }
 });
 
+app.get('/api/infinitepay/health', async (req, res) => {
+  try {
+    const hasSupabaseUrl = Boolean(SUPABASE_URL);
+    const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
+
+    let supabaseRpcOk = false;
+    let supabaseRpcError = null;
+
+    if (hasSupabaseUrl && hasServiceRoleKey) {
+      try {
+        // Safe RPC that should return null and still validate connectivity + permissions.
+        await supabaseRpc('service_get_user_id_by_email', { p_email: '__healthcheck__@example.invalid' });
+        supabaseRpcOk = true;
+      } catch (e) {
+        supabaseRpcOk = false;
+        supabaseRpcError = String(e?.message || 'rpc_failed').slice(0, 200);
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      env: {
+        hasSupabaseUrl,
+        hasServiceRoleKey,
+      },
+      supabase: {
+        rpcOk: supabaseRpcOk,
+        rpcError: supabaseRpcError,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('InfinitePay Webhook Backend rodando!');
 });
