@@ -68,6 +68,87 @@ function normalizeEventName(raw) {
   return String(raw).trim().toLowerCase();
 }
 
+function toBoolOrNull(v) {
+  if (v === true || v === 'true' || v === 1 || v === '1') return true;
+  if (v === false || v === 'false' || v === 0 || v === '0') return false;
+  return null;
+}
+
+function computeApproval({ eventName, status, evt }) {
+  const explicitApproved =
+    toBoolOrNull(evt?.data?.approved) ??
+    toBoolOrNull(evt?.data?.is_approved) ??
+    toBoolOrNull(evt?.data?.isApproved) ??
+    toBoolOrNull(evt?.approved) ??
+    toBoolOrNull(evt?.is_approved) ??
+    toBoolOrNull(evt?.isApproved);
+
+  if (explicitApproved !== null) return explicitApproved;
+
+  const explicitPaid =
+    toBoolOrNull(evt?.data?.paid) ??
+    toBoolOrNull(evt?.data?.is_paid) ??
+    toBoolOrNull(evt?.data?.isPaid) ??
+    toBoolOrNull(evt?.paid) ??
+    toBoolOrNull(evt?.is_paid) ??
+    toBoolOrNull(evt?.isPaid);
+
+  if (explicitPaid !== null) return explicitPaid;
+
+  // Normalize status/eventName based inference.
+  const okStatuses = new Set([
+    'approved',
+    'paid',
+    'succeeded',
+    'success',
+    'completed',
+    'confirmed',
+    'captured',
+    'settled',
+    'authorized',
+    'authorised',
+  ]);
+  const notOkStatuses = new Set([
+    'rejected',
+    'refused',
+    'failed',
+    'canceled',
+    'cancelled',
+    'chargeback',
+    'refunded',
+    'expired',
+    'voided',
+  ]);
+
+  if (status && okStatuses.has(status)) return true;
+  if (status && notOkStatuses.has(status)) return false;
+
+  const okEvents = new Set([
+    'payment.approved',
+    'payment.paid',
+    'payment.succeeded',
+    'transaction.approved',
+    'transaction.paid',
+  ]);
+  const notOkEvents = new Set([
+    'payment.rejected',
+    'payment.failed',
+    'payment.canceled',
+    'payment.cancelled',
+    'payment.refunded',
+    'transaction.rejected',
+    'transaction.failed',
+    'transaction.canceled',
+    'transaction.cancelled',
+    'transaction.refunded',
+  ]);
+  if (eventName && okEvents.has(eventName)) return true;
+  if (eventName && notOkEvents.has(eventName)) return false;
+
+  // Unknown: do NOT treat as not-approved.
+  return null;
+}
+
 function looksLikeUuid(v) {
   return typeof v === 'string' && /^[0-9a-fA-F-]{36}$/.test(v.trim());
 }
@@ -202,7 +283,17 @@ function sanitizeWebhookEvent(evt) {
     const data = evt?.data ?? null;
     return {
       hasData: Boolean(data),
-      event: evt?.event ?? evt?.type ?? evt?.name ?? null,
+      event:
+        evt?.event ??
+        evt?.type ??
+        evt?.name ??
+        evt?.event_name ??
+        evt?.eventName ??
+        evt?.topic ??
+        evt?.action ??
+        evt?.event_type ??
+        evt?.eventType ??
+        null,
       topLevelKeys: Object.keys(evt || {}).slice(0, 50),
       dataKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 80) : null,
       data: {
@@ -211,6 +302,30 @@ function sanitizeWebhookEvent(evt) {
           data?.payment_status ||
           data?.paymentStatus ||
           data?.transaction_status ||
+          data?.state ||
+          data?.situation ||
+          data?.status_detail ||
+          data?.statusDetail ||
+          data?.payment?.status ||
+          data?.transaction?.status ||
+          data?.charge?.status ||
+          data?.order?.status ||
+          null,
+        approved:
+          data?.approved ??
+          data?.is_approved ??
+          data?.isApproved ??
+          evt?.approved ??
+          evt?.is_approved ??
+          evt?.isApproved ??
+          null,
+        paid:
+          data?.paid ??
+          data?.is_paid ??
+          data?.isPaid ??
+          evt?.paid ??
+          evt?.is_paid ??
+          evt?.isPaid ??
           null,
         amount: data?.amount ?? data?.total_amount ?? null,
         reference:
@@ -281,13 +396,31 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       return res.status(500).json({ error: 'missing_supabase_env' });
     }
 
-    const eventNameRaw = evt.event || evt.type || evt.name || null;
+    const eventNameRaw =
+      evt?.event ||
+      evt?.type ||
+      evt?.name ||
+      evt?.event_name ||
+      evt?.eventName ||
+      evt?.topic ||
+      evt?.action ||
+      evt?.event_type ||
+      evt?.eventType ||
+      null;
     const eventName = normalizeEventName(eventNameRaw);
     const statusRaw =
       evt?.data?.status ||
       evt?.data?.payment_status ||
       evt?.data?.paymentStatus ||
       evt?.data?.transaction_status ||
+      evt?.data?.state ||
+      evt?.data?.situation ||
+      evt?.data?.status_detail ||
+      evt?.data?.statusDetail ||
+      evt?.data?.payment?.status ||
+      evt?.data?.transaction?.status ||
+      evt?.data?.charge?.status ||
+      evt?.data?.order?.status ||
       evt?.status ||
       null;
     const status = normalizeStatus(statusRaw);
@@ -295,18 +428,7 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     ctxEventName = eventName;
     ctxStatus = status;
 
-    const approved =
-      status === 'approved' ||
-      status === 'paid' ||
-      status === 'succeeded' ||
-      status === 'success' ||
-      status === 'completed' ||
-      status === 'confirmed' ||
-      eventName === 'payment.approved' ||
-      eventName === 'payment.paid' ||
-      eventName === 'payment.succeeded' ||
-      eventName === 'transaction.approved' ||
-      eventName === 'transaction.paid';
+    const approved = computeApproval({ eventName, status, evt });
 
     ctxApproved = approved;
 
@@ -422,7 +544,7 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     let outcome = 'received';
     let outcomeReason = null;
 
-    if (!approved) {
+    if (approved === false) {
       outcome = 'ignored';
       outcomeReason = 'not_approved';
       ctxOutcome = outcome;
@@ -444,6 +566,30 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         raw_event: sanitizeWebhookEvent(evt),
       });
       return res.status(200).json({ received: true });
+    }
+
+    if (approved === null) {
+      outcome = 'skipped';
+      outcomeReason = 'unknown_approval_state';
+      ctxOutcome = outcome;
+      ctxOutcomeReason = outcomeReason;
+      await logWebhookEvent({
+        provider: 'infinitepay',
+        event_name: eventName,
+        status,
+        approved,
+        provider_payment_id: providerPaymentId,
+        reference,
+        amount_cents: amountCents,
+        payer_email: payerEmail,
+        user_id: userId,
+        days,
+        outcome,
+        outcome_reason: outcomeReason,
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(evt),
+      });
+      return res.status(200).json({ received: true, skipped: true });
     }
 
     if (!userId || !days || days <= 0) {
