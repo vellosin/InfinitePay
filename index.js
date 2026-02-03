@@ -150,8 +150,94 @@ async function logWebhookEvent(eventRow) {
     // Optional: only works if the table exists in Supabase.
     await supabaseInsert('payment_webhook_events', eventRow);
   } catch (e) {
+    // If table exists but a column is missing (schema drift), retry with a minimal payload.
+    const msg = String(e?.message || e);
+    const looksLikeUnknownColumn = msg.includes('Could not find the') || msg.includes('column') || msg.includes('PGRST');
+    if (looksLikeUnknownColumn) {
+      try {
+        const {
+          provider,
+          received_at,
+          event_name,
+          status,
+          approved,
+          provider_payment_id,
+          reference,
+          amount_cents,
+          payer_email,
+          user_id,
+          days,
+          outcome,
+          outcome_reason,
+        } = eventRow || {};
+
+        await supabaseInsert('payment_webhook_events', {
+          provider,
+          received_at,
+          event_name,
+          status,
+          approved,
+          provider_payment_id,
+          reference,
+          amount_cents,
+          payer_email,
+          user_id,
+          days,
+          outcome,
+          outcome_reason,
+        });
+        return;
+      } catch {
+        // fallthrough
+      }
+    }
+
     // Never break webhook processing because of logging.
-    console.warn('Falha ao registrar payment_webhook_events (ignorado):', String(e?.message || e));
+    console.warn('Falha ao registrar payment_webhook_events (ignorado):', msg);
+  }
+}
+
+function sanitizeWebhookEvent(evt) {
+  try {
+    const data = evt?.data ?? null;
+    return {
+      hasData: Boolean(data),
+      event: evt?.event ?? evt?.type ?? evt?.name ?? null,
+      topLevelKeys: Object.keys(evt || {}).slice(0, 50),
+      dataKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 80) : null,
+      data: {
+        status:
+          data?.status ||
+          data?.payment_status ||
+          data?.paymentStatus ||
+          data?.transaction_status ||
+          null,
+        amount: data?.amount ?? data?.total_amount ?? null,
+        reference:
+          data?.reference ||
+          data?.external_reference ||
+          data?.externalReference ||
+          data?.metadata?.reference ||
+          data?.metadata?.ref ||
+          data?.metadata?.external_reference ||
+          null,
+        uid: data?.uid || data?.user_id || data?.userId || data?.metadata?.uid || data?.metadata?.user_id || data?.metadata?.userId || null,
+        days: data?.days || data?.metadata?.days || data?.metadata?.plan_days || null,
+        paymentId: data?.payment_id || data?.paymentId || data?.id || data?.transaction_id || data?.transactionId || null,
+        payerEmail:
+          data?.customer?.email ||
+          data?.payer?.email ||
+          data?.buyer?.email ||
+          data?.customer_email ||
+          data?.customerEmail ||
+          data?.buyer_email ||
+          data?.buyerEmail ||
+          data?.email ||
+          null,
+      },
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -168,6 +254,20 @@ async function applyCredits({ userId, days, amountCents, providerPaymentId, rawE
 }
 
 app.post('/api/infinitepay/webhook', async (req, res) => {
+  // Keep context for error logging.
+  let ctxEventName = null;
+  let ctxStatus = null;
+  let ctxApproved = null;
+  let ctxReference = null;
+  let ctxProviderPaymentId = null;
+  let ctxAmountCents = null;
+  let ctxPayerEmail = null;
+  let ctxUserId = null;
+  let ctxDays = null;
+  let ctxOutcome = null;
+  let ctxOutcomeReason = null;
+  const ctxTraceId = `t_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+
   try {
     const evt = req.body ?? {};
 
@@ -192,6 +292,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       null;
     const status = normalizeStatus(statusRaw);
 
+    ctxEventName = eventName;
+    ctxStatus = status;
+
     const approved =
       status === 'approved' ||
       status === 'paid' ||
@@ -204,6 +307,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       eventName === 'payment.succeeded' ||
       eventName === 'transaction.approved' ||
       eventName === 'transaction.paid';
+
+    ctxApproved = approved;
 
     // Always log a compact summary so we can confirm delivery in Vercel logs.
     try {
@@ -236,6 +341,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.reference ||
       null;
 
+    ctxReference = reference;
+
     let providerPaymentId =
       evt?.data?.payment_id ||
       evt?.data?.paymentId ||
@@ -247,8 +354,12 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       null;
     if (!providerPaymentId) providerPaymentId = stableFallbackPaymentId(evt);
 
+    ctxProviderPaymentId = providerPaymentId;
+
     const amountCents = normalizeAmountCents(evt?.data?.amount ?? evt?.data?.total_amount ?? evt?.amount);
     const inferredDays = daysFromAmount(amountCents);
+
+    ctxAmountCents = amountCents;
 
     const payerEmail =
       evt?.data?.customer?.email ||
@@ -261,6 +372,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.data?.email ||
       evt?.email ||
       null;
+
+    ctxPayerEmail = payerEmail;
 
     const parsed = parseReference(reference);
 
@@ -303,12 +416,17 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       }
     }
 
+    ctxUserId = userId;
+    ctxDays = days;
+
     let outcome = 'received';
     let outcomeReason = null;
 
     if (!approved) {
       outcome = 'ignored';
       outcomeReason = 'not_approved';
+      ctxOutcome = outcome;
+      ctxOutcomeReason = outcomeReason;
       await logWebhookEvent({
         provider: 'infinitepay',
         event_name: eventName,
@@ -322,6 +440,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         days,
         outcome,
         outcome_reason: outcomeReason,
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(evt),
       });
       return res.status(200).json({ received: true });
     }
@@ -329,12 +449,15 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     if (!userId || !days || days <= 0) {
       outcome = 'skipped';
       outcomeReason = 'missing_user_or_days';
+      ctxOutcome = outcome;
+      ctxOutcomeReason = outcomeReason;
       console.error('Webhook aprovado mas sem identificação suficiente', {
         eventName,
         status,
         reference,
         amountCents,
         providerPaymentId,
+        traceId: ctxTraceId,
       });
       await logWebhookEvent({
         provider: 'infinitepay',
@@ -349,6 +472,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         days,
         outcome,
         outcome_reason: outcomeReason,
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(evt),
       });
       return res.status(200).json({ received: true, skipped: true });
     }
@@ -356,11 +481,14 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     if (!providerPaymentId) {
       outcome = 'skipped';
       outcomeReason = 'missing_provider_payment_id';
+      ctxOutcome = outcome;
+      ctxOutcomeReason = outcomeReason;
       console.error('Webhook aprovado mas sem providerPaymentId', {
         eventName,
         status,
         reference,
         amountCents,
+        traceId: ctxTraceId,
       });
       await logWebhookEvent({
         provider: 'infinitepay',
@@ -375,12 +503,40 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         days,
         outcome,
         outcome_reason: outcomeReason,
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(evt),
       });
       return res.status(200).json({ received: true, skipped: true });
     }
 
-    await applyCredits({ userId, days, amountCents: amountCents ?? 0, providerPaymentId, rawEvent: evt });
+    try {
+      await applyCredits({ userId, days, amountCents: amountCents ?? 0, providerPaymentId, rawEvent: evt });
+    } catch (e) {
+      outcome = 'error';
+      outcomeReason = String(e?.message || e || 'apply_failed').slice(0, 200);
+      ctxOutcome = outcome;
+      ctxOutcomeReason = outcomeReason;
+      await logWebhookEvent({
+        provider: 'infinitepay',
+        event_name: eventName,
+        status,
+        approved,
+        provider_payment_id: providerPaymentId,
+        reference,
+        amount_cents: amountCents,
+        payer_email: payerEmail,
+        user_id: userId,
+        days,
+        outcome,
+        outcome_reason: outcomeReason,
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(evt),
+      });
+      throw e;
+    }
+
     outcome = 'applied';
+    ctxOutcome = outcome;
     await logWebhookEvent({
       provider: 'infinitepay',
       event_name: eventName,
@@ -394,6 +550,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       days,
       outcome,
       outcome_reason: null,
+      trace_id: ctxTraceId,
+      raw_event: null,
     });
     return res.status(200).json({ success: true });
   } catch (err) {
@@ -401,17 +559,19 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     try {
       await logWebhookEvent({
         provider: 'infinitepay',
-        event_name: null,
-        status: null,
-        approved: null,
-        provider_payment_id: null,
-        reference: null,
-        amount_cents: null,
-        payer_email: null,
-        user_id: null,
-        days: null,
+        event_name: ctxEventName,
+        status: ctxStatus,
+        approved: ctxApproved,
+        provider_payment_id: ctxProviderPaymentId,
+        reference: ctxReference,
+        amount_cents: ctxAmountCents,
+        payer_email: ctxPayerEmail,
+        user_id: ctxUserId,
+        days: ctxDays,
         outcome: 'error',
         outcome_reason: String(err?.message || err).slice(0, 200),
+        trace_id: ctxTraceId,
+        raw_event: sanitizeWebhookEvent(req?.body ?? {}),
       });
     } catch {
       // ignore
