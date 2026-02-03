@@ -118,6 +118,42 @@ function findFirstKeyMatch(root, keySet, { maxDepth = 5, maxArray = 50, maxKeys 
   return null;
 }
 
+function findFirstStringMatch(root, regex, { maxDepth = 5, maxArray = 50, maxKeys = 400 } = {}) {
+  const seen = new Set();
+  const queue = [{ value: root, depth: 0 }];
+  let visitedKeys = 0;
+
+  while (queue.length) {
+    const { value, depth } = queue.shift();
+    if (value === null || value === undefined) continue;
+
+    if (typeof value === 'string') {
+      if (regex.test(value)) return value;
+      continue;
+    }
+
+    if (typeof value !== 'object') continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    if (depth >= maxDepth) continue;
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < Math.min(value.length, maxArray); i++) {
+        queue.push({ value: value[i], depth: depth + 1 });
+      }
+      continue;
+    }
+
+    for (const k of Object.keys(value)) {
+      visitedKeys++;
+      if (visitedKeys > maxKeys) return null;
+      queue.push({ value: value[k], depth: depth + 1 });
+    }
+  }
+
+  return null;
+}
+
 function computeApproval({ eventName, status, evt }) {
   const explicitApproved =
     toBoolOrNull(evt?.data?.approved) ??
@@ -539,13 +575,22 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.data?.reference ||
       evt?.data?.external_reference ||
       evt?.data?.externalReference ||
+      evt?.data?.order_reference ||
+      evt?.data?.orderReference ||
+      evt?.data?.description ||
+      evt?.data?.title ||
+      evt?.data?.message ||
       evt?.data?.metadata?.reference ||
       evt?.data?.metadata?.ref ||
       evt?.data?.metadata?.external_reference ||
       evt?.reference ||
       null;
 
-    ctxReference = reference;
+    // Some providers move our reference/metadata around; try to find any reference-like string.
+    const referenceRegex = /user_[0-9a-fA-F-]{36}_(?:days_\d{1,4}|\d{1,4}|premium|standard)/;
+    const referenceScanned = reference ?? findFirstStringMatch(evt, referenceRegex);
+
+    ctxReference = referenceScanned;
 
     let providerPaymentId =
       evt?.data?.payment_id ||
@@ -577,9 +622,25 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.email ||
       null;
 
-    ctxPayerEmail = payerEmail;
+    const payerEmailScanned =
+      payerEmail ??
+      findFirstKeyMatch(
+        evt,
+        new Set([
+          'email',
+          'customer_email',
+          'customeremail',
+          'buyer_email',
+          'buyeremail',
+          'payer_email',
+          'payeremail',
+        ])
+      )?.value ??
+      null;
 
-    const parsed = parseReference(reference);
+    ctxPayerEmail = payerEmailScanned;
+
+    const parsed = parseReference(referenceScanned);
 
     let userId = parsed?.user_id ?? null;
     let days = parsed?.days ?? null;
@@ -611,8 +672,8 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
 
     // Fallback: tenta resolver por email (se o webhook trouxer email do pagador)
     if (!userId) {
-      if (payerEmail) {
-        const resolved = await supabaseRpc('service_get_user_id_by_email', { p_email: payerEmail });
+      if (payerEmailScanned) {
+        const resolved = await supabaseRpc('service_get_user_id_by_email', { p_email: payerEmailScanned });
         // PostgREST pode retornar "uuid" como string ou [{...}] dependendo da função;
         if (typeof resolved === 'string') userId = resolved;
         else if (Array.isArray(resolved) && resolved[0]?.user_id) userId = resolved[0].user_id;
@@ -637,9 +698,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         status,
         approved,
         provider_payment_id: providerPaymentId,
-        reference,
+          reference: referenceScanned,
         amount_cents: amountCents,
-        payer_email: payerEmail,
+          payer_email: payerEmailScanned,
         user_id: userId,
         days,
         outcome,
@@ -661,9 +722,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         status,
         approved,
         provider_payment_id: providerPaymentId,
-        reference,
+        reference: referenceScanned,
         amount_cents: amountCents,
-        payer_email: payerEmail,
+        payer_email: payerEmailScanned,
         user_id: userId,
         days,
         outcome,
@@ -693,9 +754,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         status,
         approved,
         provider_payment_id: providerPaymentId,
-        reference,
+        reference: referenceScanned,
         amount_cents: amountCents,
-        payer_email: payerEmail,
+        payer_email: payerEmailScanned,
         user_id: userId,
         days,
         outcome,
@@ -724,9 +785,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         status,
         approved,
         provider_payment_id: providerPaymentId,
-        reference,
+        reference: referenceScanned,
         amount_cents: amountCents,
-        payer_email: payerEmail,
+        payer_email: payerEmailScanned,
         user_id: userId,
         days,
         outcome,
@@ -750,9 +811,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         status,
         approved,
         provider_payment_id: providerPaymentId,
-        reference,
+        reference: referenceScanned,
         amount_cents: amountCents,
-        payer_email: payerEmail,
+        payer_email: payerEmailScanned,
         user_id: userId,
         days,
         outcome,
@@ -771,9 +832,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       status,
       approved,
       provider_payment_id: providerPaymentId,
-      reference,
+      reference: referenceScanned,
       amount_cents: amountCents,
-      payer_email: payerEmail,
+      payer_email: payerEmailScanned,
       user_id: userId,
       days,
       outcome,
