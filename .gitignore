@@ -1,2 +1,4 @@
 node_modules/
 .env
+payment_webhook_events_rows.csv
+*.csv

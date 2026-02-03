@@ -554,7 +554,7 @@ async function applyCredits({ userId, days, amountCents, providerPaymentId, rawE
 async function tryMatchIntent({ amountCents, providerPaymentId }) {
   // Tries to match a pending intent created by the frontend when the webhook doesn't include user info.
   // Only auto-matches if there is exactly 1 candidate within the window.
-  if (!Number.isFinite(amountCents)) return null;
+  if (!Number.isFinite(amountCents)) return { intent: null, reason: 'invalid_amount' };
 
   const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const qs = new URLSearchParams({
@@ -568,10 +568,11 @@ async function tryMatchIntent({ amountCents, providerPaymentId }) {
   });
 
   const rows = await supabaseSelect('payment_intents', qs.toString());
-  if (!Array.isArray(rows) || rows.length !== 1) return null;
+  if (!Array.isArray(rows) || rows.length === 0) return { intent: null, reason: 'no_candidate' };
+  if (rows.length !== 1) return { intent: null, reason: 'multiple_candidates' };
 
   const intent = rows[0];
-  if (!intent?.id || !intent?.user_id) return null;
+  if (!intent?.id || !intent?.user_id) return { intent: null, reason: 'invalid_intent_row' };
 
   // Claim it (best-effort) to avoid double matching.
   const claimQs = new URLSearchParams({
@@ -584,9 +585,9 @@ async function tryMatchIntent({ amountCents, providerPaymentId }) {
     provider_payment_id: providerPaymentId ?? null,
     matched_at: nowIso(),
   });
-  if (!Array.isArray(claimed) || claimed.length !== 1) return null;
+  if (!Array.isArray(claimed) || claimed.length !== 1) return { intent: null, reason: 'claim_failed' };
 
-  return intent;
+  return { intent, reason: 'matched' };
 }
 
 app.post('/api/infinitepay/webhook', async (req, res) => {
@@ -603,6 +604,7 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
   let ctxIntentId = null;
   let ctxOutcome = null;
   let ctxOutcomeReason = null;
+  let ctxIntentMatchReason = null;
   const ctxTraceId = `t_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
 
   try {
@@ -815,7 +817,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
     // Definitive fallback: match a pending intent by amount (created by the frontend right before opening checkout)
     if (!userId) {
       try {
-        const intent = await tryMatchIntent({ amountCents, providerPaymentId });
+        const match = await tryMatchIntent({ amountCents, providerPaymentId });
+        ctxIntentMatchReason = match?.reason ?? null;
+        const intent = match?.intent ?? null;
         if (intent?.user_id) {
           userId = intent.user_id;
           ctxIntentId = intent.id;
@@ -883,7 +887,9 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
 
     if (!userId || !days || days <= 0) {
       outcome = 'skipped';
-      outcomeReason = 'missing_user_or_days';
+      outcomeReason = ctxIntentMatchReason
+        ? `missing_user_or_days_${ctxIntentMatchReason}`
+        : 'missing_user_or_days';
       ctxOutcome = outcome;
       ctxOutcomeReason = outcomeReason;
       console.error('Webhook aprovado mas sem identificação suficiente', {
@@ -892,6 +898,7 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         reference,
         amountCents,
         providerPaymentId,
+        intentMatchReason: ctxIntentMatchReason,
         traceId: ctxTraceId,
       });
       await logWebhookEvent({
@@ -951,6 +958,22 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       outcomeReason = String(e?.message || e || 'apply_failed').slice(0, 200);
       ctxOutcome = outcome;
       ctxOutcomeReason = outcomeReason;
+
+      // If we had matched an intent, mark it as error for easier manual recovery.
+      if (ctxIntentId) {
+        try {
+          const qs = new URLSearchParams({ id: `eq.${ctxIntentId}`, select: 'id' });
+          await supabasePatch('payment_intents', qs.toString(), {
+            status: 'error',
+            provider_payment_id: providerPaymentId ?? null,
+            matched_at: nowIso(),
+            note: `apply_failed: ${outcomeReason}`.slice(0, 240),
+          });
+        } catch {
+          // ignore
+        }
+      }
+
       await logWebhookEvent({
         provider: 'infinitepay',
         event_name: eventName,
