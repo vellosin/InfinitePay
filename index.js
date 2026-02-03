@@ -721,7 +721,22 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
 
     ctxProviderPaymentId = providerPaymentId;
 
-    const amountCents = normalizeAmountCents(evt?.data?.amount ?? evt?.data?.total_amount ?? evt?.amount);
+    const amountRaw =
+      evt?.data?.amount ??
+      evt?.data?.total_amount ??
+      evt?.amount ??
+      evt?.total_amount ??
+      // Some payloads only include paid_amount
+      evt?.paid_amount ??
+      evt?.paidAmount ??
+      null;
+
+    const amountFallback =
+      amountRaw ??
+      findFirstKeyMatch(evt, new Set(['amount', 'total_amount', 'paid_amount', 'paidamount']))?.value ??
+      null;
+
+    const amountCents = normalizeAmountCents(amountFallback);
     const inferredDays = daysFromAmount(amountCents);
 
     ctxAmountCents = amountCents;
