@@ -32,8 +32,13 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 const SUPPORT_ADMIN_EMAIL = process.env.SUPPORT_ADMIN_EMAIL || '12lucasvelloso@gmail.com';
-// Must be a verified sender in Resend, e.g. "PBF Support <support@yourdomain.com>"
+// NOTE: Resend requires a verified sender domain. If you don't have a domain,
+// you can use "onboarding@resend.dev" as the sender.
 const SUPPORT_FROM_EMAIL = process.env.SUPPORT_FROM_EMAIL || null;
+// Where email replies should go (optional). Defaults to SUPPORT_ADMIN_EMAIL.
+const SUPPORT_REPLY_TO_EMAIL = process.env.SUPPORT_REPLY_TO_EMAIL || null;
+
+const RESEND_FALLBACK_FROM_EMAIL = 'onboarding@resend.dev';
 
 const BUILD_INFO = {
   commit: process.env.VERCEL_GIT_COMMIT_SHA || null,
@@ -57,6 +62,35 @@ function getSupabaseProjectRef(url) {
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env var: ${name}`);
   return value;
+}
+
+function pickSupportFromEmail() {
+  const raw = String(SUPPORT_FROM_EMAIL || '').trim();
+  if (!raw) return RESEND_FALLBACK_FROM_EMAIL;
+
+  // Consumer inbox domains can't be verified by you in Resend.
+  const lowered = raw.toLowerCase();
+  const blockedDomains = [
+    '@gmail.com',
+    '@googlemail.com',
+    '@hotmail.com',
+    '@outlook.com',
+    '@live.com',
+    '@icloud.com',
+    '@me.com',
+    '@yahoo.com',
+    '@proton.me',
+    '@protonmail.com',
+  ];
+  if (blockedDomains.some((d) => lowered.endsWith(d))) return RESEND_FALLBACK_FROM_EMAIL;
+
+  return raw;
+}
+
+function pickSupportReplyToEmail() {
+  const raw = String(SUPPORT_REPLY_TO_EMAIL || '').trim();
+  if (raw) return raw;
+  return String(SUPPORT_ADMIN_EMAIL || '').trim() || null;
 }
 
 function normalizeAmountCents(raw) {
@@ -493,7 +527,7 @@ app.post('/api/infinitepay/intent', async (req, res) => {
 
 async function resendSendEmail({ from, to, subject, text, replyTo }) {
   requireEnv('RESEND_API_KEY', RESEND_API_KEY);
-  if (!from) throw new Error('Missing SUPPORT_FROM_EMAIL');
+  if (!from) throw new Error('Missing sender email (SUPPORT_FROM_EMAIL)');
 
   const resp = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -564,8 +598,11 @@ app.post('/api/infinitepay/support', async (req, res) => {
       `Ticket: ${ticketId}`,
     ].join('\n');
 
+    const fromEmail = pickSupportFromEmail();
+    const adminReplyTo = pickSupportReplyToEmail();
+
     await resendSendEmail({
-      from: SUPPORT_FROM_EMAIL,
+      from: fromEmail,
       to: SUPPORT_ADMIN_EMAIL,
       subject,
       text: adminText,
@@ -573,11 +610,11 @@ app.post('/api/infinitepay/support', async (req, res) => {
     });
 
     await resendSendEmail({
-      from: SUPPORT_FROM_EMAIL,
+      from: fromEmail,
       to: userEmail,
       subject: ackSubject,
       text: ackText,
-      replyTo: SUPPORT_ADMIN_EMAIL,
+      replyTo: adminReplyTo,
     });
 
     return res.status(200).json({ ok: true, ticketId });
