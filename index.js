@@ -120,6 +120,16 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
   try {
     const evt = req.body ?? {};
 
+    const hasSupabaseUrl = Boolean(SUPABASE_URL);
+    const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
+    if (!hasSupabaseUrl || !hasServiceRoleKey) {
+      console.error('Webhook recebido mas env do Supabase ausente', {
+        hasSupabaseUrl,
+        hasServiceRoleKey,
+      });
+      return res.status(500).json({ error: 'missing_supabase_env' });
+    }
+
     const eventNameRaw = evt.event || evt.type || evt.name || null;
     const eventName = normalizeEventName(eventNameRaw);
     const statusRaw =
@@ -141,6 +151,27 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       eventName === 'payment.succeeded' ||
       eventName === 'transaction.approved' ||
       eventName === 'transaction.paid';
+
+    // Always log a compact summary so we can confirm delivery in Vercel logs.
+    try {
+      console.log('InfinitePay webhook summary', {
+        eventName,
+        status,
+        approved,
+        hasReference: Boolean(
+          evt?.data?.reference ||
+            evt?.data?.external_reference ||
+            evt?.data?.externalReference ||
+            evt?.data?.metadata?.reference ||
+            evt?.data?.metadata?.ref ||
+            evt?.data?.metadata?.external_reference ||
+            evt?.reference
+        ),
+        hasId: Boolean(evt?.data?.id || evt?.data?.payment_id || evt?.data?.transaction_id || evt?.id),
+      });
+    } catch {
+      // ignore
+    }
 
     if (!approved) {
       return res.status(200).json({ received: true });
