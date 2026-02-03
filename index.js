@@ -1,5 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import { createHash } from 'node:crypto';
 
 dotenv.config();
 
@@ -36,6 +37,35 @@ function parseReference(reference) {
   m = reference.match(/^user_([0-9a-fA-F-]{36})_(premium|standard)$/);
   if (m) return { user_id: m[1], days: m[2] === 'premium' ? 30 : 0 };
   return null;
+}
+
+function normalizeStatus(raw) {
+  if (!raw) return null;
+  return String(raw).trim().toLowerCase();
+}
+
+function normalizeEventName(raw) {
+  if (!raw) return null;
+  return String(raw).trim().toLowerCase();
+}
+
+function looksLikeUuid(v) {
+  return typeof v === 'string' && /^[0-9a-fA-F-]{36}$/.test(v.trim());
+}
+
+function safeNumber(v) {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === 'string' ? Number(v) : v;
+  return Number.isFinite(n) ? n : null;
+}
+
+function stableFallbackPaymentId(evt) {
+  try {
+    const raw = JSON.stringify(evt ?? {});
+    return createHash('sha256').update(raw).digest('hex').slice(0, 32);
+  } catch {
+    return null;
+  }
 }
 
 function daysFromAmount(amountCents) {
@@ -90,33 +120,82 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
   try {
     const evt = req.body ?? {};
 
-    const eventName = evt.event || evt.type || evt.name || null;
-    const status = evt?.data?.status || evt?.data?.payment_status || evt?.status || null;
+    const eventNameRaw = evt.event || evt.type || evt.name || null;
+    const eventName = normalizeEventName(eventNameRaw);
+    const statusRaw =
+      evt?.data?.status ||
+      evt?.data?.payment_status ||
+      evt?.data?.paymentStatus ||
+      evt?.data?.transaction_status ||
+      evt?.status ||
+      null;
+    const status = normalizeStatus(statusRaw);
+
     const approved =
       status === 'approved' ||
       status === 'paid' ||
+      status === 'succeeded' ||
+      status === 'success' ||
       eventName === 'payment.approved' ||
-      eventName === 'payment.paid';
+      eventName === 'payment.paid' ||
+      eventName === 'payment.succeeded' ||
+      eventName === 'transaction.approved' ||
+      eventName === 'transaction.paid';
 
     if (!approved) {
       return res.status(200).json({ received: true });
     }
 
-    const reference = evt?.data?.reference || evt?.data?.external_reference || evt?.reference || null;
+    const reference =
+      evt?.data?.reference ||
+      evt?.data?.external_reference ||
+      evt?.data?.externalReference ||
+      evt?.data?.metadata?.reference ||
+      evt?.data?.metadata?.ref ||
+      evt?.data?.metadata?.external_reference ||
+      evt?.reference ||
+      null;
     const parsed = parseReference(reference);
 
-    const providerPaymentId =
+    let providerPaymentId =
       evt?.data?.payment_id ||
+      evt?.data?.paymentId ||
       evt?.data?.id ||
+      evt?.data?.transaction_id ||
+      evt?.data?.transactionId ||
       evt?.payment_id ||
       evt?.id ||
       null;
+    if (!providerPaymentId) providerPaymentId = stableFallbackPaymentId(evt);
 
     const amountCents = normalizeAmountCents(evt?.data?.amount ?? evt?.data?.total_amount ?? evt?.amount);
     const inferredDays = daysFromAmount(amountCents);
 
     let userId = parsed?.user_id ?? null;
     let days = parsed?.days ?? null;
+
+    // Alternative metadata-based identification (when reference is not preserved)
+    if (!userId) {
+      const maybeUserId =
+        evt?.data?.uid ||
+        evt?.data?.user_id ||
+        evt?.data?.userId ||
+        evt?.data?.metadata?.uid ||
+        evt?.data?.metadata?.user_id ||
+        evt?.data?.metadata?.userId ||
+        null;
+      if (looksLikeUuid(maybeUserId)) userId = String(maybeUserId).trim();
+    }
+
+    if (!days) {
+      const maybeDays =
+        evt?.data?.days ||
+        evt?.data?.metadata?.days ||
+        evt?.data?.metadata?.plan_days ||
+        null;
+      const n = safeNumber(maybeDays);
+      if (Number.isFinite(n) && n > 0) days = Math.round(n);
+    }
 
     if (!days && inferredDays) days = inferredDays;
 
@@ -125,6 +204,11 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       const payerEmail =
         evt?.data?.customer?.email ||
         evt?.data?.payer?.email ||
+        evt?.data?.buyer?.email ||
+        evt?.data?.customer_email ||
+        evt?.data?.customerEmail ||
+        evt?.data?.buyer_email ||
+        evt?.data?.buyerEmail ||
         evt?.data?.email ||
         evt?.email ||
         null;
@@ -149,6 +233,16 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       return res.status(200).json({ received: true, skipped: true });
     }
 
+    if (!providerPaymentId) {
+      console.error('Webhook aprovado mas sem providerPaymentId', {
+        eventName,
+        status,
+        reference,
+        amountCents,
+      });
+      return res.status(200).json({ received: true, skipped: true });
+    }
+
     await applyCredits({ userId, days, amountCents: amountCents ?? 0, providerPaymentId, rawEvent: evt });
     return res.status(200).json({ success: true });
   } catch (err) {
@@ -161,7 +255,5 @@ app.get('/', (req, res) => {
   res.send('InfinitePay Webhook Backend rodando!');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+// Vercel Serverless Function entrypoint
+export default (req, res) => app(req, res);
