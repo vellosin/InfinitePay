@@ -44,6 +44,10 @@ function normalizeAmountCents(raw) {
   return Math.round(n);
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function parseReference(reference) {
   if (!reference || typeof reference !== 'string') return null;
   // user_<uuid>_days_<N>
@@ -187,6 +191,18 @@ function computeApproval({ eventName, status, evt }) {
       evt?.data?.capturedAt
   );
   if (hasPaidAt) return true;
+
+  // Amount-based signals: if paid_amount equals or exceeds amount, treat as paid.
+  const amountCents = normalizeAmountCents(
+    evt?.data?.amount ?? evt?.data?.total_amount ?? evt?.amount ?? evt?.total_amount ?? null
+  );
+  const paidAmountCents = normalizeAmountCents(
+    evt?.data?.paid_amount ?? evt?.data?.paidAmount ?? evt?.paid_amount ?? evt?.paidAmount ?? null
+  );
+  if (Number.isFinite(amountCents) && amountCents > 0 && Number.isFinite(paidAmountCents)) {
+    if (paidAmountCents >= amountCents) return true;
+    if (paidAmountCents === 0) return false;
+  }
 
   // Normalize status/eventName based inference.
   const okStatuses = new Set([
@@ -335,6 +351,56 @@ async function supabaseInsert(tableName, payload) {
   return null;
 }
 
+async function supabaseSelect(tableName, queryString) {
+  requireEnv('SUPABASE_URL', SUPABASE_URL);
+  requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/${tableName}?${queryString}`, {
+    method: 'GET',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Supabase select ${tableName} failed (${resp.status}): ${text}`);
+  }
+  try {
+    return text ? JSON.parse(text) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function supabasePatch(tableName, queryString, payload) {
+  requireEnv('SUPABASE_URL', SUPABASE_URL);
+  requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/${tableName}?${queryString}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(payload ?? {}),
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Supabase patch ${tableName} failed (${resp.status}): ${text}`);
+  }
+  try {
+    return text ? JSON.parse(text) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function logWebhookEvent(eventRow) {
   try {
     // Optional: only works if the table exists in Supabase.
@@ -442,6 +508,8 @@ function sanitizeWebhookEvent(evt) {
           evt?.isPaid ??
           null,
         amount: data?.amount ?? data?.total_amount ?? null,
+        topAmount: evt?.amount ?? evt?.total_amount ?? null,
+        topPaidAmount: evt?.paid_amount ?? evt?.paidAmount ?? null,
         reference:
           data?.reference ||
           data?.external_reference ||
@@ -453,6 +521,7 @@ function sanitizeWebhookEvent(evt) {
         uid: data?.uid || data?.user_id || data?.userId || data?.metadata?.uid || data?.metadata?.user_id || data?.metadata?.userId || null,
         days: data?.days || data?.metadata?.days || data?.metadata?.plan_days || null,
         paymentId: data?.payment_id || data?.paymentId || data?.id || data?.transaction_id || data?.transactionId || null,
+        topPaymentId: evt?.payment_id || evt?.paymentId || evt?.id || evt?.transaction_id || evt?.transactionId || evt?.transaction_nsu || evt?.order_nsu || evt?.invoice_slug || null,
         payerEmail:
           data?.customer?.email ||
           data?.payer?.email ||
@@ -482,6 +551,44 @@ async function applyCredits({ userId, days, amountCents, providerPaymentId, rawE
   });
 }
 
+async function tryMatchIntent({ amountCents, providerPaymentId }) {
+  // Tries to match a pending intent created by the frontend when the webhook doesn't include user info.
+  // Only auto-matches if there is exactly 1 candidate within the window.
+  if (!Number.isFinite(amountCents)) return null;
+
+  const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const qs = new URLSearchParams({
+    select: 'id,user_id,days,created_at',
+    provider: 'eq.infinitepay',
+    status: 'eq.pending',
+    amount_cents: `eq.${amountCents}`,
+    created_at: `gte.${since}`,
+    order: 'created_at.desc',
+    limit: '2',
+  });
+
+  const rows = await supabaseSelect('payment_intents', qs.toString());
+  if (!Array.isArray(rows) || rows.length !== 1) return null;
+
+  const intent = rows[0];
+  if (!intent?.id || !intent?.user_id) return null;
+
+  // Claim it (best-effort) to avoid double matching.
+  const claimQs = new URLSearchParams({
+    id: `eq.${intent.id}`,
+    status: 'eq.pending',
+    select: 'id',
+  });
+  const claimed = await supabasePatch('payment_intents', claimQs.toString(), {
+    status: 'matched',
+    provider_payment_id: providerPaymentId ?? null,
+    matched_at: nowIso(),
+  });
+  if (!Array.isArray(claimed) || claimed.length !== 1) return null;
+
+  return intent;
+}
+
 app.post('/api/infinitepay/webhook', async (req, res) => {
   // Keep context for error logging.
   let ctxEventName = null;
@@ -493,6 +600,7 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
   let ctxPayerEmail = null;
   let ctxUserId = null;
   let ctxDays = null;
+  let ctxIntentId = null;
   let ctxOutcome = null;
   let ctxOutcomeReason = null;
   const ctxTraceId = `t_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
@@ -598,8 +706,16 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
       evt?.data?.id ||
       evt?.data?.transaction_id ||
       evt?.data?.transactionId ||
+      evt?.data?.transaction_nsu ||
+      evt?.data?.order_nsu ||
+      evt?.data?.invoice_slug ||
       evt?.payment_id ||
       evt?.id ||
+      evt?.transaction_id ||
+      evt?.transactionId ||
+      evt?.transaction_nsu ||
+      evt?.order_nsu ||
+      evt?.invoice_slug ||
       null;
     if (!providerPaymentId) providerPaymentId = stableFallbackPaymentId(evt);
 
@@ -678,6 +794,21 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         if (typeof resolved === 'string') userId = resolved;
         else if (Array.isArray(resolved) && resolved[0]?.user_id) userId = resolved[0].user_id;
         else if (resolved?.user_id) userId = resolved.user_id;
+      }
+    }
+
+    // Definitive fallback: match a pending intent by amount (created by the frontend right before opening checkout)
+    if (!userId) {
+      try {
+        const intent = await tryMatchIntent({ amountCents, providerPaymentId });
+        if (intent?.user_id) {
+          userId = intent.user_id;
+          ctxIntentId = intent.id;
+          if (!days && Number(intent?.days) > 0) days = Number(intent.days);
+        }
+      } catch (e) {
+        // ignore, we will handle as missing user below
+        console.warn('Falha ao tentar casar payment_intent (ignorado):', String(e?.message || e));
       }
     }
 
@@ -822,6 +953,20 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
         raw_event: sanitizeWebhookEvent(evt),
       });
       throw e;
+    }
+
+    // Mark matched intent as applied (best-effort).
+    if (ctxIntentId) {
+      try {
+        const qs = new URLSearchParams({ id: `eq.${ctxIntentId}`, select: 'id' });
+        await supabasePatch('payment_intents', qs.toString(), {
+          status: 'applied',
+          provider_payment_id: providerPaymentId ?? null,
+          matched_at: nowIso(),
+        });
+      } catch (e) {
+        console.warn('Falha ao marcar payment_intent como applied (ignorado):', String(e?.message || e));
+      }
     }
 
     outcome = 'applied';
