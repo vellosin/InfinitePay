@@ -12,7 +12,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   try {
     const path = req?.path || '';
-    if (!path.startsWith('/api/infinitepay/intent')) return next();
+    if (!path.startsWith('/api/infinitepay/intent') && !path.startsWith('/api/infinitepay/support')) return next();
 
     const origin = req.headers?.origin;
     res.setHeader('Access-Control-Allow-Origin', origin || '*');
@@ -29,6 +29,11 @@ app.use((req, res, next) => {
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
+const SUPPORT_ADMIN_EMAIL = process.env.SUPPORT_ADMIN_EMAIL || '12lucasvelloso@gmail.com';
+// Must be a verified sender in Resend, e.g. "PBF Support <support@yourdomain.com>"
+const SUPPORT_FROM_EMAIL = process.env.SUPPORT_FROM_EMAIL || null;
 
 const BUILD_INFO = {
   commit: process.env.VERCEL_GIT_COMMIT_SHA || null,
@@ -399,7 +404,7 @@ async function supabaseInsertReturning(tableName, payload, { select = 'id' } = {
   }
 }
 
-async function supabaseAuthGetUserIdFromBearer(bearerToken) {
+async function supabaseAuthGetUserFromBearer(bearerToken) {
   requireEnv('SUPABASE_URL', SUPABASE_URL);
   requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
 
@@ -418,7 +423,7 @@ async function supabaseAuthGetUserIdFromBearer(bearerToken) {
   if (!resp.ok) return null;
   try {
     const json = text ? JSON.parse(text) : null;
-    return json?.id ?? null;
+    return json || null;
   } catch {
     return null;
   }
@@ -437,7 +442,8 @@ app.post('/api/infinitepay/intent', async (req, res) => {
     const token = m?.[1] || null;
     if (!token) return res.status(401).json({ error: 'missing_bearer_token' });
 
-    const userId = await supabaseAuthGetUserIdFromBearer(token);
+    const user = await supabaseAuthGetUserFromBearer(token);
+    const userId = user?.id ?? null;
     if (!userId) return res.status(401).json({ error: 'invalid_session' });
 
     const amountCents = normalizeAmountCents(req?.body?.amount_cents ?? req?.body?.amountCents ?? null);
@@ -482,6 +488,103 @@ app.post('/api/infinitepay/intent', async (req, res) => {
   } catch (e) {
     console.error('Erro ao criar payment_intent:', e);
     return res.status(500).json({ error: 'intent_create_failed' });
+  }
+});
+
+async function resendSendEmail({ from, to, subject, text, replyTo }) {
+  requireEnv('RESEND_API_KEY', RESEND_API_KEY);
+  if (!from) throw new Error('Missing SUPPORT_FROM_EMAIL');
+
+  const resp = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to,
+      subject,
+      text,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    }),
+  });
+
+  const textResp = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Resend failed (${resp.status}): ${textResp}`);
+  }
+  return textResp;
+}
+
+app.post('/api/infinitepay/support', async (req, res) => {
+  try {
+    const hasSupabaseUrl = Boolean(SUPABASE_URL);
+    const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
+    if (!hasSupabaseUrl || !hasServiceRoleKey) {
+      return res.status(500).json({ error: 'missing_supabase_env' });
+    }
+
+    const auth = req.headers?.authorization || req.headers?.Authorization || '';
+    const m = String(auth).match(/^Bearer\s+(.+)$/i);
+    const token = m?.[1] || null;
+    if (!token) return res.status(401).json({ error: 'missing_bearer_token' });
+
+    const user = await supabaseAuthGetUserFromBearer(token);
+    const userId = user?.id ?? null;
+    const userEmail = user?.email ?? null;
+    if (!userId || !userEmail) return res.status(401).json({ error: 'invalid_session' });
+
+    const subjectIn = typeof req?.body?.subject === 'string' ? req.body.subject.trim() : '';
+    const messageIn = typeof req?.body?.message === 'string' ? req.body.message.trim() : '';
+    const localeIn = typeof req?.body?.locale === 'string' ? req.body.locale.trim() : null;
+
+    if (!messageIn || messageIn.length < 10) {
+      return res.status(400).json({ error: 'invalid_message' });
+    }
+
+    const ticketId = `s_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+    const subject = subjectIn ? `[PBF Support] ${subjectIn} (${ticketId})` : `[PBF Support] New message (${ticketId})`;
+
+    const adminText = [
+      `Ticket: ${ticketId}`,
+      `User ID: ${userId}`,
+      `User Email: ${userEmail}`,
+      localeIn ? `Locale: ${localeIn}` : null,
+      '',
+      messageIn,
+    ].filter(Boolean).join('\n');
+
+    const ackSubject = `PBF Support — We received your message / Recebemos sua mensagem / Hemos recibido tu mensaje (${ticketId})`;
+    const ackText = [
+      'EN: We received your message and we are reviewing it. We will reply as soon as possible.',
+      'PT: Recebemos sua mensagem e estamos analisando. Vamos responder o quanto antes.',
+      'ES: Hemos recibido tu mensaje y lo estamos revisando. Responderemos lo antes posible.',
+      '',
+      `Ticket: ${ticketId}`,
+    ].join('\n');
+
+    await resendSendEmail({
+      from: SUPPORT_FROM_EMAIL,
+      to: SUPPORT_ADMIN_EMAIL,
+      subject,
+      text: adminText,
+      replyTo: userEmail,
+    });
+
+    await resendSendEmail({
+      from: SUPPORT_FROM_EMAIL,
+      to: userEmail,
+      subject: ackSubject,
+      text: ackText,
+      replyTo: SUPPORT_ADMIN_EMAIL,
+    });
+
+    return res.status(200).json({ ok: true, ticketId });
+  } catch (e) {
+    console.error('Erro ao enviar suporte:', e);
+    const msg = String(e?.message || 'support_failed').slice(0, 220);
+    return res.status(500).json({ error: 'support_failed', message: msg });
   }
 });
 
