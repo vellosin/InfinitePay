@@ -16,6 +16,19 @@ const BUILD_INFO = {
   env: process.env.VERCEL_ENV || null,
 };
 
+function getSupabaseProjectRef(url) {
+  try {
+    if (!url) return null;
+    const u = new URL(url);
+    const host = u.hostname || '';
+    const parts = host.split('.');
+    const ref = parts?.[0] || null;
+    return ref || null;
+  } catch {
+    return null;
+  }
+}
+
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env var: ${name}`);
   return value;
@@ -439,6 +452,14 @@ app.get('/api/infinitepay/health', async (req, res) => {
     const hasSupabaseUrl = Boolean(SUPABASE_URL);
     const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
 
+    const supabaseProjectRef = getSupabaseProjectRef(SUPABASE_URL);
+    let supabaseHost = null;
+    try {
+      supabaseHost = SUPABASE_URL ? new URL(SUPABASE_URL).hostname : null;
+    } catch {
+      supabaseHost = null;
+    }
+
     let supabaseRpcOk = false;
     let supabaseRpcError = null;
 
@@ -491,6 +512,8 @@ app.get('/api/infinitepay/health', async (req, res) => {
         hasServiceRoleKey,
       },
       supabase: {
+        projectRef: supabaseProjectRef,
+        host: supabaseHost,
         rpcOk: supabaseRpcOk,
         rpcError: supabaseRpcError,
         logWriteOk,
