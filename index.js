@@ -7,6 +7,26 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// CORS for browser-initiated calls (PBF frontend calls /api/infinitepay/intent).
+// This endpoint uses Authorization header, which triggers preflight (OPTIONS).
+app.use((req, res, next) => {
+  try {
+    const path = req?.path || '';
+    if (!path.startsWith('/api/infinitepay/intent')) return next();
+
+    const origin = req.headers?.origin;
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') return res.status(204).send('');
+  } catch {
+    // ignore
+  }
+  next();
+});
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
