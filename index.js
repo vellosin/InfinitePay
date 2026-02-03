@@ -351,6 +351,120 @@ async function supabaseInsert(tableName, payload) {
   return null;
 }
 
+async function supabaseInsertReturning(tableName, payload, { select = 'id' } = {}) {
+  requireEnv('SUPABASE_URL', SUPABASE_URL);
+  requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+
+  const qs = new URLSearchParams({ select });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/${tableName}?${qs.toString()}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(payload ?? {}),
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Supabase insert ${tableName} failed (${resp.status}): ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function supabaseAuthGetUserIdFromBearer(bearerToken) {
+  requireEnv('SUPABASE_URL', SUPABASE_URL);
+  requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+
+  if (!bearerToken || typeof bearerToken !== 'string') return null;
+
+  const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: 'GET',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${bearerToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) return null;
+  try {
+    const json = text ? JSON.parse(text) : null;
+    return json?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+app.post('/api/infinitepay/intent', async (req, res) => {
+  try {
+    const hasSupabaseUrl = Boolean(SUPABASE_URL);
+    const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
+    if (!hasSupabaseUrl || !hasServiceRoleKey) {
+      return res.status(500).json({ error: 'missing_supabase_env' });
+    }
+
+    const auth = req.headers?.authorization || req.headers?.Authorization || '';
+    const m = String(auth).match(/^Bearer\s+(.+)$/i);
+    const token = m?.[1] || null;
+    if (!token) return res.status(401).json({ error: 'missing_bearer_token' });
+
+    const userId = await supabaseAuthGetUserIdFromBearer(token);
+    if (!userId) return res.status(401).json({ error: 'invalid_session' });
+
+    const amountCents = normalizeAmountCents(req?.body?.amount_cents ?? req?.body?.amountCents ?? null);
+    const daysRaw = safeNumber(req?.body?.days ?? null);
+    const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.round(daysRaw) : daysFromAmount(amountCents);
+
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ error: 'invalid_amount' });
+    }
+    if (!Number.isFinite(days) || days <= 0) {
+      return res.status(400).json({ error: 'invalid_days' });
+    }
+
+    // Best-effort: cancel any previous pending intents for this user+amount to reduce ambiguity.
+    try {
+      const qs = new URLSearchParams({
+        provider: 'eq.infinitepay',
+        status: 'eq.pending',
+        user_id: `eq.${userId}`,
+        amount_cents: `eq.${amountCents}`,
+        select: 'id',
+      });
+      await supabasePatch('payment_intents', qs.toString(), {
+        status: 'canceled',
+        note: 'superseded_by_new_intent',
+      });
+    } catch {
+      // ignore
+    }
+
+    const rows = await supabaseInsertReturning('payment_intents', {
+      user_id: userId,
+      provider: 'infinitepay',
+      amount_cents: amountCents,
+      days,
+      status: 'pending',
+      note: 'server_create_intent',
+    });
+
+    const intentId = Array.isArray(rows) ? rows?.[0]?.id : null;
+    return res.status(200).json({ ok: true, intentId, userId, amountCents, days });
+  } catch (e) {
+    console.error('Erro ao criar payment_intent:', e);
+    return res.status(500).json({ error: 'intent_create_failed' });
+  }
+});
+
 async function supabaseSelect(tableName, queryString) {
   requireEnv('SUPABASE_URL', SUPABASE_URL);
   requireEnv('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
