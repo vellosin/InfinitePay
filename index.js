@@ -5,7 +5,16 @@ import { createHash } from 'node:crypto';
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    try {
+      req.rawBody = buf ? buf.toString('utf8') : '';
+    } catch {
+      req.rawBody = '';
+    }
+  },
+}));
 
 // CORS for browser-initiated calls (PBF frontend calls /api/infinitepay/intent).
 // This endpoint uses Authorization header, which triggers preflight (OPTIONS).
@@ -14,9 +23,11 @@ app.use((req, res, next) => {
     const path = req?.path || '';
     if (!path.startsWith('/api/infinitepay/intent') && !path.startsWith('/api/infinitepay/support')) return next();
 
-    const origin = req.headers?.origin;
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-    res.setHeader('Vary', 'Origin');
+    const origin = String(req.headers?.origin || '').trim();
+    if (origin && CORS_ALLOWED_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
@@ -45,6 +56,75 @@ const BUILD_INFO = {
   url: process.env.VERCEL_URL || null,
   env: process.env.VERCEL_ENV || null,
 };
+
+const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || 'https://pbf.vellosol.com.br,http://localhost:5173,http://127.0.0.1:5173')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const HEALTHCHECK_TOKEN = String(process.env.HEALTHCHECK_TOKEN || '').trim();
+const INFINITEPAY_WEBHOOK_SECRET = String(process.env.INFINITEPAY_WEBHOOK_SECRET || '').trim();
+
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
+}
+
+function extractSignature(req) {
+  const candidates = [
+    req.headers?.['x-signature'],
+    req.headers?.['x-webhook-signature'],
+    req.headers?.['x-infinitepay-signature'],
+  ].filter(Boolean);
+  if (!candidates.length) return null;
+  const raw = String(candidates[0]);
+  return raw.includes('=') ? raw.split('=').pop()?.trim() : raw.trim();
+}
+
+function verifyWebhookSignature(req) {
+  if (!INFINITEPAY_WEBHOOK_SECRET) return { ok: true, skipped: true };
+  const sig = extractSignature(req);
+  if (!sig) return { ok: false, reason: 'missing_signature' };
+  const body = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body ?? {});
+  const expected = createHash('sha256').update(`${INFINITEPAY_WEBHOOK_SECRET}:${body}`).digest('hex');
+  if (!safeEqual(sig, expected)) return { ok: false, reason: 'invalid_signature' };
+  return { ok: true, skipped: false };
+}
+
+const rateBuckets = new Map();
+function rateLimit({ windowMs = 60_000, limit = 60 } = {}) {
+  return (req, res, next) => {
+    try {
+      const ip = String(req.headers?.['cf-connecting-ip'] || req.ip || 'unknown');
+      const key = `${req.path}|${ip}`;
+      const now = Date.now();
+      const cur = rateBuckets.get(key);
+      if (!cur || now > cur.resetAt) {
+        rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+        return next();
+      }
+      cur.count += 1;
+      if (cur.count > limit) {
+        return res.status(429).json({ error: 'rate_limited' });
+      }
+    } catch {
+      // fail-open
+    }
+    next();
+  };
+}
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  next();
+});
+
 
 function getSupabaseProjectRef(url) {
   try {
@@ -462,6 +542,11 @@ async function supabaseAuthGetUserFromBearer(bearerToken) {
     return null;
   }
 }
+
+app.use('/api/infinitepay/intent', rateLimit({ windowMs: 60_000, limit: 40 }));
+app.use('/api/infinitepay/support', rateLimit({ windowMs: 60_000, limit: 20 }));
+app.use('/api/infinitepay/webhook', rateLimit({ windowMs: 60_000, limit: 120 }));
+app.use('/api/infinitepay/health', rateLimit({ windowMs: 60_000, limit: 10 }));
 
 app.post('/api/infinitepay/intent', async (req, res) => {
   try {
@@ -883,6 +968,11 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
 
   try {
     const evt = req.body ?? {};
+    const signatureCheck = verifyWebhookSignature(req);
+    if (!signatureCheck.ok) {
+      return res.status(401).json({ error: signatureCheck.reason || 'invalid_signature' });
+    }
+
 
     const hasSupabaseUrl = Boolean(SUPABASE_URL);
     const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
@@ -1328,24 +1418,6 @@ app.post('/api/infinitepay/webhook', async (req, res) => {
 
 // Some providers perform a GET/HEAD handshake to validate the endpoint before sending POSTs.
 app.get('/api/infinitepay/webhook', async (req, res) => {
-  try {
-    await logWebhookEvent({
-      provider: 'infinitepay',
-      event_name: 'handshake',
-      status: null,
-      approved: null,
-      provider_payment_id: null,
-      reference: null,
-      amount_cents: null,
-      payer_email: null,
-      user_id: null,
-      days: null,
-      outcome: 'handshake',
-      outcome_reason: null,
-    });
-  } catch {
-    // ignore
-  }
   return res.status(200).json({ ok: true });
 });
 
@@ -1355,6 +1427,8 @@ app.head('/api/infinitepay/webhook', (req, res) => {
 
 app.get('/api/infinitepay/health', async (req, res) => {
   try {
+    const reqToken = String(req.headers?.['x-health-token'] || req.query?.token || '').trim();
+    const isAuthorized = Boolean(!HEALTHCHECK_TOKEN || (reqToken && safeEqual(reqToken, HEALTHCHECK_TOKEN)));
     const hasSupabaseUrl = Boolean(SUPABASE_URL);
     const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
 
@@ -1408,6 +1482,10 @@ app.get('/api/infinitepay/health', async (req, res) => {
         logWriteOk = false;
         logWriteError = String(e?.message || e || 'log_write_failed').slice(0, 200);
       }
+    }
+
+    if (!isAuthorized) {
+      return res.status(200).json({ ok: true });
     }
 
     return res.status(200).json({
