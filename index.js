@@ -1,6 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 
 dotenv.config();
 
@@ -79,19 +79,39 @@ function extractSignature(req) {
     req.headers?.['x-webhook-signature'],
     req.headers?.['x-infinitepay-signature'],
   ].filter(Boolean);
-  if (!candidates.length) return null;
-  const raw = String(candidates[0]);
-  return raw.includes('=') ? raw.split('=').pop()?.trim() : raw.trim();
+  if (!candidates.length) return { value: null, algoHint: null };
+  const raw = String(candidates[0]).trim();
+
+  // Accept common formats like:
+  // - sha256=<hex>
+  // - hmac-sha256=<hex>
+  // - <hex>
+  const m = raw.match(/^([a-z0-9_-]+)=([a-fA-F0-9]+)$/i);
+  if (m) {
+    return { value: String(m[2] || '').trim().toLowerCase(), algoHint: String(m[1] || '').toLowerCase() };
+  }
+
+  return { value: raw.toLowerCase(), algoHint: null };
 }
 
 function verifyWebhookSignature(req) {
   if (!INFINITEPAY_WEBHOOK_SECRET) return { ok: true, skipped: true };
-  const sig = extractSignature(req);
+
+  const parsed = extractSignature(req);
+  const sig = parsed?.value;
   if (!sig) return { ok: false, reason: 'missing_signature' };
+
   const body = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body ?? {});
-  const expected = createHash('sha256').update(`${INFINITEPAY_WEBHOOK_SECRET}:${body}`).digest('hex');
-  if (!safeEqual(sig, expected)) return { ok: false, reason: 'invalid_signature' };
-  return { ok: true, skipped: false };
+
+  // Primary strategy: HMAC-SHA256(body, secret)
+  const expectedHmac = createHmac('sha256', INFINITEPAY_WEBHOOK_SECRET).update(body).digest('hex');
+  if (safeEqual(sig, expectedHmac)) return { ok: true, skipped: false, mode: 'hmac_sha256' };
+
+  // Backward compatibility fallback from previous internal implementation.
+  const expectedLegacy = createHash('sha256').update(`${INFINITEPAY_WEBHOOK_SECRET}:${body}`).digest('hex');
+  if (safeEqual(sig, expectedLegacy)) return { ok: true, skipped: false, mode: 'legacy_sha256' };
+
+  return { ok: false, reason: 'invalid_signature' };
 }
 
 const rateBuckets = new Map();
