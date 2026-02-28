@@ -1435,5 +1435,13 @@ app.get('/', (req, res) => {
   res.send('InfinitePay Webhook Backend rodando!');
 });
 
+// Local runtime (systemd/node) support
+if (!process.env.VERCEL) {
+  const PORT = Number(process.env.PORT || 8787);
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`InfinitePay backend listening on http://127.0.0.1:${PORT}`);
+  });
+}
+
 // Vercel Serverless Function entrypoint
 export default (req, res) => app(req, res);
