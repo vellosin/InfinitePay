@@ -1,8 +1,5 @@
 import express from 'express';
-import dotenv from 'dotenv';
 import { createHash, createHmac } from 'node:crypto';
-
-dotenv.config();
 
 const app = express();
 app.disable('x-powered-by');
@@ -1448,7 +1445,7 @@ app.head('/api/infinitepay/webhook', (req, res) => {
 app.get('/api/infinitepay/health', async (req, res) => {
   try {
     const reqToken = String(req.headers?.['x-health-token'] || req.query?.token || '').trim();
-    const isAuthorized = Boolean(!HEALTHCHECK_TOKEN || (reqToken && safeEqual(reqToken, HEALTHCHECK_TOKEN)));
+    const isAuthorized = Boolean(HEALTHCHECK_TOKEN && reqToken && safeEqual(reqToken, HEALTHCHECK_TOKEN));
     const hasSupabaseUrl = Boolean(SUPABASE_URL);
     const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY);
 

@@ -5,9 +5,10 @@ Backend minimalista em Node.js (Express) para receber webhooks da InfinitePay e 
 ## Endpoints
 - `POST /api/infinitepay/webhook`: Recebe notificações da InfinitePay (apenas loga o payload por enquanto).
 
-## Variáveis de ambiente (Vercel)
+## Configuração de segredos
 - `SUPABASE_URL`: URL do projeto Supabase (ex: `https://xxxx.supabase.co`)
 - `SUPABASE_SERVICE_ROLE_KEY`: Service Role Key (somente backend)
+- Em execução local, os segredos devem ser fornecidos pelo gerenciador de serviço do sistema, fora do repositório.
 
 Opcional (fallback de identificação):
 - O webhook tenta identificar o usuário por `reference` (recomendado) e, se não existir, tenta por email do pagador via RPC.
